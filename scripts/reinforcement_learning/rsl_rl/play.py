@@ -34,6 +34,12 @@ parser.add_argument(
     help="Use the pre-trained checkpoint from Nucleus.",
 )
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
+parser.add_argument(
+    "--autoreset",
+    action="store_true",
+    default=False,
+    help="Automatically reset completed OmniReset play environments on success.",
+)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -67,6 +73,7 @@ from isaaclab.envs import (
     ManagerBasedRLEnvCfg,
     multi_agent_to_single_agent,
 )
+from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.utils.assets import retrieve_file_path
 from isaaclab.utils.dict import print_dict
 
@@ -77,6 +84,7 @@ from uwlab_rl.rsl_rl.exporter import export_policy_as_jit, export_policy_as_onnx
 import isaaclab_tasks  # noqa: F401
 import uwlab_tasks  # noqa: F401
 from isaaclab_tasks.utils import get_checkpoint_path
+from uwlab_tasks.manager_based.manipulation.omnireset import mdp as omnireset_mdp
 from uwlab_tasks.utils.hydra import hydra_task_config
 
 # PLACEHOLDER: Extension template (do not remove this comment)
@@ -100,6 +108,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # note: certain randomizations occur in the environment initialization so we set the seed here
     env_cfg.seed = agent_cfg.seed
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
+
+    if args_cli.autoreset:
+        if "OmniReset" not in task_name:
+            raise ValueError("--autoreset is currently only supported for OmniReset tasks.")
+        env_cfg.terminations.success = DoneTerm(
+            func=omnireset_mdp.consecutive_success_state_with_min_length,
+            params={"num_consecutive_successes": 5, "min_episode_length": 10},
+        )
 
     # specify directory for logging experiments
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
