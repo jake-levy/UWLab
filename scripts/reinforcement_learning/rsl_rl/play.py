@@ -20,6 +20,12 @@ parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
 parser.add_argument("--video", action="store_true", default=False, help="Record videos during training.")
 parser.add_argument("--video_length", type=int, default=200, help="Length of the recorded video (in steps).")
 parser.add_argument(
+    "--video_fps",
+    type=int,
+    default=None,
+    help="Playback FPS for recorded videos. Defaults to the environment step rate if unset.",
+)
+parser.add_argument(
     "--disable_fabric", action="store_true", default=False, help="Disable fabric and use USD I/O operations."
 )
 parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
@@ -182,6 +188,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             raise ValueError("DURATION_FRAMES for --zoom-out-vid must be > 0.")
         if args_cli.zoom_out_vid[0] + args_cli.zoom_out_vid[1] > args_cli.video_length:
             raise ValueError("START_FRAMES + DURATION_FRAMES for --zoom-out-vid must be <= --video_length.")
+    if args_cli.video_fps is not None and args_cli.video_fps <= 0:
+        raise ValueError("--video_fps must be > 0.")
 
     # specify directory for logging experiments
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
@@ -215,6 +223,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             "video_folder": os.path.join(log_dir, "videos", "play"),
             "step_trigger": lambda step: step == 0,
             "video_length": args_cli.video_length,
+            "fps": args_cli.video_fps,
             "disable_logger": True,
         }
         print("[INFO] Recording videos during training.")

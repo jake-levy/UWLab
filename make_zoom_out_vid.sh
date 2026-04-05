@@ -6,6 +6,7 @@ python scripts/reinforcement_learning/rsl_rl/play.py \
     env.scene.receptive_object=peghole \
     --headless \
     --video \
-    --video_length 70 \
+    --video_length 105 \
     --autoreset \
-    --zoom-out-vid 30 10
+    --zoom-out-vid 45 15 \
+    --video_fps 30
