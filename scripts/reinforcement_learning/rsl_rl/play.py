@@ -73,6 +73,12 @@ parser.add_argument(
     help="Override the scene dome light HDRI. Use 'soft' or pass a direct HDRI path.",
 )
 parser.add_argument(
+    "--hide_vention_metal",
+    action="store_true",
+    default=False,
+    help="Hide the table's /visuals/vention_metal mesh in all environments.",
+)
+parser.add_argument(
     "--zoom-out-vid",
     nargs=2,
     type=int,
@@ -134,6 +140,7 @@ import numpy as np
 import os
 import time
 import torch
+import isaaclab.sim as sim_utils
 
 from rsl_rl.runners import DistillationRunner, OnPolicyRunner
 
@@ -240,6 +247,22 @@ def _resolve_hdri_override(hdri_arg: str) -> str:
     return hdri_presets.get(hdri_arg, hdri_arg)
 
 
+def _hide_vention_metal_visuals():
+    """Hide the pat_vention metal visuals in all cloned environments."""
+    prim_paths = sim_utils.find_matching_prim_paths("/World/envs/env_.*/Table/visuals/vention_metal")
+    if not prim_paths:
+        raise ValueError(
+            "--hide_vention_metal could not find any prims matching "
+            "'/World/envs/env_.*/Table/visuals/vention_metal'."
+        )
+
+    for prim_path in prim_paths:
+        prim = sim_utils.get_prim_at_path(prim_path)
+        sim_utils.set_prim_visibility(prim, False)
+
+    print(f"[INFO] Hid {len(prim_paths)} vention_metal visual prim(s).")
+
+
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     """Play with RSL-RL agent."""
@@ -336,6 +359,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+    if args_cli.hide_vention_metal:
+        _hide_vention_metal_visuals()
 
     # convert to single-agent instance if required by the RL algorithm
     if isinstance(env.unwrapped, DirectMARLEnv):
