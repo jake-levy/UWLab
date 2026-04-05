@@ -20,6 +20,12 @@ parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
 parser.add_argument("--video", action="store_true", default=False, help="Record videos during training.")
 parser.add_argument("--video_length", type=int, default=200, help="Length of the recorded video (in steps).")
 parser.add_argument(
+    "--video_name",
+    type=str,
+    default=None,
+    help="Filename prefix for recorded videos. Defaults to Gymnasium's standard prefix if unset.",
+)
+parser.add_argument(
     "--video_fps",
     type=int,
     default=None,
@@ -330,6 +336,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         raise ValueError("--zoom-out-distance-delta requires --zoom-out-vid.")
     if args_cli.video_fps is not None and args_cli.video_fps <= 0:
         raise ValueError("--video_fps must be > 0.")
+    if args_cli.video_name is not None:
+        if not args_cli.video:
+            raise ValueError("--video_name requires --video.")
+        if not args_cli.video_name.strip():
+            raise ValueError("--video_name must not be empty.")
     if args_cli.video_size is not None:
         if not args_cli.video:
             raise ValueError("--video_size requires --video.")
@@ -375,6 +386,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             "fps": args_cli.video_fps,
             "disable_logger": True,
         }
+        if args_cli.video_name is not None:
+            video_kwargs["name_prefix"] = args_cli.video_name
         print("[INFO] Recording videos during training.")
         print_dict(video_kwargs, nesting=4)
         env = gym.wrappers.RecordVideo(env, **video_kwargs)
