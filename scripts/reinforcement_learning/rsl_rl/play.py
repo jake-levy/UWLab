@@ -26,6 +26,14 @@ parser.add_argument(
     help="Playback FPS for recorded videos. Defaults to the environment step rate if unset.",
 )
 parser.add_argument(
+    "--video_size",
+    nargs=2,
+    type=int,
+    metavar=("WIDTH", "HEIGHT"),
+    default=None,
+    help="Resolution for recorded videos as WIDTH HEIGHT. Defaults to the task viewer resolution if unset.",
+)
+parser.add_argument(
     "--disable_fabric", action="store_true", default=False, help="Disable fabric and use USD I/O operations."
 )
 parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
@@ -190,6 +198,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             raise ValueError("START_FRAMES + DURATION_FRAMES for --zoom-out-vid must be <= --video_length.")
     if args_cli.video_fps is not None and args_cli.video_fps <= 0:
         raise ValueError("--video_fps must be > 0.")
+    if args_cli.video_size is not None:
+        if not args_cli.video:
+            raise ValueError("--video_size requires --video.")
+        if args_cli.video_size[0] <= 0 or args_cli.video_size[1] <= 0:
+            raise ValueError("WIDTH and HEIGHT for --video_size must be > 0.")
+
+        env_cfg.viewer.resolution = (args_cli.video_size[0], args_cli.video_size[1])
 
     # specify directory for logging experiments
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
