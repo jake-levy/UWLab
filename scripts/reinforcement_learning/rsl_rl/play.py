@@ -55,6 +55,24 @@ parser.add_argument(
     help="Automatically reset completed OmniReset play environments on success.",
 )
 parser.add_argument(
+    "--disable_ambient_occlusion",
+    action="store_true",
+    default=False,
+    help="Disable ambient occlusion for rendering and recorded videos.",
+)
+parser.add_argument(
+    "--dome_light_intensity",
+    type=float,
+    default=None,
+    help="Override the scene dome light intensity.",
+)
+parser.add_argument(
+    "--dome_light_hdri",
+    type=str,
+    default=None,
+    help="Override the scene dome light HDRI. Use 'soft' or pass a direct HDRI path.",
+)
+parser.add_argument(
     "--zoom-out-vid",
     nargs=2,
     type=int,
@@ -127,7 +145,7 @@ from isaaclab.envs import (
     multi_agent_to_single_agent,
 )
 from isaaclab.managers import TerminationTermCfg as DoneTerm
-from isaaclab.utils.assets import retrieve_file_path
+from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR, retrieve_file_path
 from isaaclab.utils.dict import print_dict
 
 from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper
@@ -213,6 +231,15 @@ def _interpolate_camera_pose(frame_idx, start_frames, duration_frames, start_eye
     return eye, lookat
 
 
+def _resolve_hdri_override(hdri_arg: str) -> str:
+    """Resolve a CLI HDRI override into a concrete texture path."""
+    hdri_presets = {
+        "soft": f"{ISAAC_NUCLEUS_DIR}/Assets/Skies/Cloudy/kloofendal_48d_partly_cloudy_4k.hdr",
+        "softer": f"{ISAAC_NUCLEUS_DIR}/Assets/Skies/Cloudy/table_mountain_1_4k.hdr",
+    }
+    return hdri_presets.get(hdri_arg, hdri_arg)
+
+
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     """Play with RSL-RL agent."""
@@ -231,6 +258,24 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # note: certain randomizations occur in the environment initialization so we set the seed here
     env_cfg.seed = agent_cfg.seed
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
+    if args_cli.disable_ambient_occlusion:
+        env_cfg.sim.render.enable_ambient_occlusion = False
+    if args_cli.dome_light_intensity is not None:
+        if args_cli.dome_light_intensity < 0.0:
+            raise ValueError("--dome_light_intensity must be >= 0.")
+        sky_light_cfg = getattr(env_cfg.scene, "sky_light", None) or getattr(env_cfg.scene, "dome_light", None)
+        if sky_light_cfg is None or not hasattr(sky_light_cfg, "spawn") or sky_light_cfg.spawn is None:
+            raise ValueError("This task does not expose a configurable dome/sky light.")
+        if not hasattr(sky_light_cfg.spawn, "intensity"):
+            raise ValueError("This task's sky light does not support intensity override.")
+        sky_light_cfg.spawn.intensity = args_cli.dome_light_intensity
+    if args_cli.dome_light_hdri is not None:
+        sky_light_cfg = getattr(env_cfg.scene, "sky_light", None) or getattr(env_cfg.scene, "dome_light", None)
+        if sky_light_cfg is None or not hasattr(sky_light_cfg, "spawn") or sky_light_cfg.spawn is None:
+            raise ValueError("This task does not expose a configurable dome/sky light.")
+        if not hasattr(sky_light_cfg.spawn, "texture_file"):
+            raise ValueError("This task's sky light does not support HDRI override.")
+        sky_light_cfg.spawn.texture_file = _resolve_hdri_override(args_cli.dome_light_hdri)
 
     if args_cli.autoreset:
         if "OmniReset" not in task_name:

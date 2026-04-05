@@ -22,11 +22,17 @@ python scripts/reinforcement_learning/rsl_rl/play.py \
     env.scene.receptive_object=peghole \
     --headless \
     --video \
-    --video_length 10 \
+    --video_length 35 \
     --autoreset \
-    --zoom-out-vid 5 2 \
-    --zoom-out-start-spherical 0 60 1.3 \
+    --zoom-out-vid 20 5 \
+    --zoom-out-start-spherical 0 60 1.2 \
     --zoom-out-start-origin-delta 0.3 0.0 0.0 \
     --zoom-out-distance-delta -6.0 \
     --video_fps 30 \
-    --video_size 1920 1080
+    --video_size 1920 1080 \
+    --dome_light_hdri soft
+
+
+
+
+    # --disable_ambient_occlusion
