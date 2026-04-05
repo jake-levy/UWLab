@@ -71,3 +71,7 @@ tests/
 
 # Docker history
 .uw-lab-docker-history
+
+.codex
+*.pt
+exported/
