@@ -40,6 +40,14 @@ parser.add_argument(
     default=False,
     help="Automatically reset completed OmniReset play environments on success.",
 )
+parser.add_argument(
+    "--zoom-out-vid",
+    nargs=2,
+    type=int,
+    metavar=("START_FRAMES", "DURATION_FRAMES"),
+    default=None,
+    help="For recorded videos, hold the initial camera for START_FRAMES, then linearly zoom out for DURATION_FRAMES.",
+)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -60,6 +68,7 @@ simulation_app = app_launcher.app
 """Rest everything follows."""
 
 import gymnasium as gym
+import numpy as np
 import os
 import time
 import torch
@@ -90,6 +99,54 @@ from uwlab_tasks.utils.hydra import hydra_task_config
 # PLACEHOLDER: Extension template (do not remove this comment)
 
 
+def _compute_zoom_out_camera_poses(env, viewer_cfg):
+    """Compute the start and end camera poses for zoom-out video capture."""
+    if viewer_cfg.origin_type != "world":
+        raise ValueError("--zoom-out-vid currently only supports tasks with viewer.origin_type='world'.")
+
+    start_eye = np.asarray(viewer_cfg.eye, dtype=float)
+    start_lookat = np.asarray(viewer_cfg.lookat, dtype=float)
+
+    env_origins = env.unwrapped.scene.env_origins.detach().cpu().numpy()
+    env_xy_min = env_origins[:, :2].min(axis=0)
+    env_xy_max = env_origins[:, :2].max(axis=0)
+    env_xy_center = 0.5 * (env_xy_min + env_xy_max)
+    all_envs_center = np.array([env_xy_center[0], env_xy_center[1], start_lookat[2]], dtype=float)
+
+    base_view_vec = start_eye - start_lookat
+    base_distance = float(np.linalg.norm(base_view_vec))
+    if base_distance <= 1e-6:
+        raise ValueError("Viewer eye and lookat cannot be identical when using --zoom-out-vid.")
+
+    span_xy = env_xy_max - env_xy_min
+    max_span = float(max(span_xy[0], span_xy[1]))
+    zoom_scale = max(1.0, 1.0 + max_span / 1.5)
+
+    end_eye = all_envs_center + base_view_vec * zoom_scale
+    end_eye[2] = max(end_eye[2], start_eye[2] + 0.25 * max_span)
+    end_lookat = all_envs_center
+    return start_eye, start_lookat, end_eye, end_lookat
+
+
+def _set_video_camera_pose(env, eye, lookat):
+    """Set the viewport camera pose used for recorded rgb_array frames."""
+    env.unwrapped.sim.set_camera_view(eye=eye.tolist(), target=lookat.tolist())
+
+
+def _interpolate_camera_pose(frame_idx, start_frames, duration_frames, start_eye, start_lookat, end_eye, end_lookat):
+    """Return the camera pose to use for a given recorded frame."""
+    if frame_idx < start_frames:
+        return start_eye, start_lookat
+    if duration_frames <= 0 or frame_idx >= start_frames + duration_frames:
+        return end_eye, end_lookat
+
+    alpha = (frame_idx - start_frames + 1) / duration_frames
+    alpha = min(max(alpha, 0.0), 1.0)
+    eye = (1.0 - alpha) * start_eye + alpha * end_eye
+    lookat = (1.0 - alpha) * start_lookat + alpha * end_lookat
+    return eye, lookat
+
+
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     """Play with RSL-RL agent."""
@@ -116,6 +173,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             func=omnireset_mdp.consecutive_success_state_with_min_length,
             params={"num_consecutive_successes": 5, "min_episode_length": 10},
         )
+    if args_cli.zoom_out_vid is not None:
+        if not args_cli.video:
+            raise ValueError("--zoom-out-vid requires --video.")
+        if args_cli.zoom_out_vid[0] < 0:
+            raise ValueError("START_FRAMES for --zoom-out-vid must be >= 0.")
+        if args_cli.zoom_out_vid[1] <= 0:
+            raise ValueError("DURATION_FRAMES for --zoom-out-vid must be > 0.")
+        if args_cli.zoom_out_vid[0] + args_cli.zoom_out_vid[1] > args_cli.video_length:
+            raise ValueError("START_FRAMES + DURATION_FRAMES for --zoom-out-vid must be <= --video_length.")
 
     # specify directory for logging experiments
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
@@ -198,11 +264,38 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # reset environment
     obs = env.get_observations()
     timestep = 0
+    zoom_camera_poses = None
+    if args_cli.zoom_out_vid is not None:
+        zoom_camera_poses = _compute_zoom_out_camera_poses(env, env_cfg.viewer)
+        start_frames, duration_frames = args_cli.zoom_out_vid
+        print(
+            f"[INFO] Applying zoom-out video camera: hold {start_frames} frames, zoom for {duration_frames} frames."
+        )
+        print_dict(
+            {
+                "start_eye": zoom_camera_poses[0].tolist(),
+                "start_lookat": zoom_camera_poses[1].tolist(),
+                "end_eye": zoom_camera_poses[2].tolist(),
+                "end_lookat": zoom_camera_poses[3].tolist(),
+            },
+            nesting=4,
+        )
     # simulate environment
     while simulation_app.is_running():
         start_time = time.time()
         # run everything in inference mode
         with torch.inference_mode():
+            if zoom_camera_poses is not None:
+                eye, lookat = _interpolate_camera_pose(
+                    timestep,
+                    start_frames,
+                    duration_frames,
+                    zoom_camera_poses[0],
+                    zoom_camera_poses[1],
+                    zoom_camera_poses[2],
+                    zoom_camera_poses[3],
+                )
+                _set_video_camera_pose(env, eye, lookat)
             # agent stepping
             actions = policy(obs)
             # env stepping
