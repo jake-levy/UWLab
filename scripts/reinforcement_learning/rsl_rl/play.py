@@ -62,6 +62,36 @@ parser.add_argument(
     default=None,
     help="For recorded videos, hold the initial camera for START_FRAMES, then linearly zoom out for DURATION_FRAMES.",
 )
+parser.add_argument(
+    "--zoom-out-start-eye-delta",
+    nargs=3,
+    type=float,
+    metavar=("DX", "DY", "DZ"),
+    default=None,
+    help="Offset applied to the zoom-out video start eye position. The end eye is recomputed to preserve view direction.",
+)
+parser.add_argument(
+    "--zoom-out-start-spherical",
+    nargs=3,
+    type=float,
+    metavar=("AZIMUTH_DEG", "ALTITUDE_DEG", "DISTANCE"),
+    default=None,
+    help="Alternative way to set the zoom-out video start eye from azimuth, altitude, and distance relative to lookat.",
+)
+parser.add_argument(
+    "--zoom-out-start-origin-delta",
+    nargs=3,
+    type=float,
+    metavar=("DX", "DY", "DZ"),
+    default=None,
+    help="Offset applied to the spherical origin used by --zoom-out-start-spherical.",
+)
+parser.add_argument(
+    "--zoom-out-distance-delta",
+    type=float,
+    default=0.0,
+    help="Additional distance added to the computed final zoom-out camera distance.",
+)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -113,13 +143,34 @@ from uwlab_tasks.utils.hydra import hydra_task_config
 # PLACEHOLDER: Extension template (do not remove this comment)
 
 
-def _compute_zoom_out_camera_poses(env, viewer_cfg):
+def _compute_zoom_out_camera_poses(
+    env, viewer_cfg, start_eye_delta=None, start_spherical=None, start_origin_delta=None, distance_delta=0.0
+):
     """Compute the start and end camera poses for zoom-out video capture."""
     if viewer_cfg.origin_type != "world":
         raise ValueError("--zoom-out-vid currently only supports tasks with viewer.origin_type='world'.")
 
-    start_eye = np.asarray(viewer_cfg.eye, dtype=float)
     start_lookat = np.asarray(viewer_cfg.lookat, dtype=float)
+    if start_origin_delta is not None:
+        start_lookat = start_lookat + np.asarray(start_origin_delta, dtype=float)
+    if start_spherical is not None:
+        azimuth_deg, altitude_deg, distance = start_spherical
+        if distance <= 0.0:
+            raise ValueError("DISTANCE for --zoom-out-start-spherical must be > 0.")
+        azimuth = np.deg2rad(azimuth_deg)
+        altitude = np.deg2rad(altitude_deg)
+        start_eye = start_lookat + np.array(
+            [
+                distance * np.cos(altitude) * np.cos(azimuth),
+                distance * np.cos(altitude) * np.sin(azimuth),
+                distance * np.sin(altitude),
+            ],
+            dtype=float,
+        )
+    else:
+        start_eye = np.asarray(viewer_cfg.eye, dtype=float)
+    if start_eye_delta is not None:
+        start_eye = start_eye + np.asarray(start_eye_delta, dtype=float)
 
     env_origins = env.unwrapped.scene.env_origins.detach().cpu().numpy()
     env_xy_min = env_origins[:, :2].min(axis=0)
@@ -136,7 +187,8 @@ def _compute_zoom_out_camera_poses(env, viewer_cfg):
     max_span = float(max(span_xy[0], span_xy[1]))
     zoom_scale = max(1.0, 1.0 + max_span / 1.5)
 
-    end_eye = all_envs_center + base_view_vec * zoom_scale
+    end_distance = max(base_distance, base_distance * zoom_scale + distance_delta)
+    end_eye = all_envs_center + (base_view_vec / base_distance) * end_distance
     end_eye[2] = max(end_eye[2], start_eye[2] + 0.25 * max_span)
     end_lookat = all_envs_center
     return start_eye, start_lookat, end_eye, end_lookat
@@ -196,6 +248,18 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             raise ValueError("DURATION_FRAMES for --zoom-out-vid must be > 0.")
         if args_cli.zoom_out_vid[0] + args_cli.zoom_out_vid[1] > args_cli.video_length:
             raise ValueError("START_FRAMES + DURATION_FRAMES for --zoom-out-vid must be <= --video_length.")
+    if args_cli.zoom_out_start_eye_delta is not None and args_cli.zoom_out_vid is None:
+        raise ValueError("--zoom-out-start-eye-delta requires --zoom-out-vid.")
+    if args_cli.zoom_out_start_spherical is not None and args_cli.zoom_out_vid is None:
+        raise ValueError("--zoom-out-start-spherical requires --zoom-out-vid.")
+    if args_cli.zoom_out_start_origin_delta is not None and args_cli.zoom_out_vid is None:
+        raise ValueError("--zoom-out-start-origin-delta requires --zoom-out-vid.")
+    if args_cli.zoom_out_start_eye_delta is not None and args_cli.zoom_out_start_spherical is not None:
+        raise ValueError("--zoom-out-start-eye-delta and --zoom-out-start-spherical are mutually exclusive.")
+    if args_cli.zoom_out_start_origin_delta is not None and args_cli.zoom_out_start_spherical is None:
+        raise ValueError("--zoom-out-start-origin-delta requires --zoom-out-start-spherical.")
+    if args_cli.zoom_out_distance_delta != 0.0 and args_cli.zoom_out_vid is None:
+        raise ValueError("--zoom-out-distance-delta requires --zoom-out-vid.")
     if args_cli.video_fps is not None and args_cli.video_fps <= 0:
         raise ValueError("--video_fps must be > 0.")
     if args_cli.video_size is not None:
@@ -290,7 +354,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     timestep = 0
     zoom_camera_poses = None
     if args_cli.zoom_out_vid is not None:
-        zoom_camera_poses = _compute_zoom_out_camera_poses(env, env_cfg.viewer)
+        zoom_camera_poses = _compute_zoom_out_camera_poses(
+            env,
+            env_cfg.viewer,
+            start_eye_delta=args_cli.zoom_out_start_eye_delta,
+            start_spherical=args_cli.zoom_out_start_spherical,
+            start_origin_delta=args_cli.zoom_out_start_origin_delta,
+            distance_delta=args_cli.zoom_out_distance_delta,
+        )
         start_frames, duration_frames = args_cli.zoom_out_vid
         print(
             f"[INFO] Applying zoom-out video camera: hold {start_frames} frames, zoom for {duration_frames} frames."
