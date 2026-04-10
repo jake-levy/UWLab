@@ -9,6 +9,7 @@
 
 import argparse
 import sys
+from dataclasses import dataclass
 
 from isaaclab.app import AppLauncher
 
@@ -128,6 +129,28 @@ parser.add_argument(
     default=0.0,
     help="Additional distance added to the computed final zoom-out camera distance.",
 )
+parser.add_argument(
+    "--perturb-video",
+    action="store_true",
+    default=False,
+    help="Enable perturbation video overlays (currently badge + frame). Requires --video.",
+)
+parser.add_argument(
+    "--perturb-xyz",
+    nargs=3,
+    type=float,
+    metavar=("DX", "DY", "DZ"),
+    default=None,
+    help="Constant Cartesian perturbation added to the first three action dimensions.",
+)
+parser.add_argument(
+    "--perturb-intervals",
+    nargs=2,
+    type=int,
+    metavar=("OFF_FRAMES", "ON_FRAMES"),
+    default=None,
+    help="Cycle perturbation with OFF_FRAMES disabled followed by ON_FRAMES enabled.",
+)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -153,6 +176,7 @@ import os
 import time
 import torch
 import isaaclab.sim as sim_utils
+import cv2
 
 from rsl_rl.runners import DistillationRunner, OnPolicyRunner
 
@@ -338,6 +362,81 @@ def _hide_vention_metal_visuals():
     print(f"[INFO] Hid {len(prim_paths)} vention_metal visual prim(s).")
 
 
+@dataclass
+class PerturbationOverlayState:
+    """Shared perturbation state used by the video overlay wrapper."""
+
+    active: bool = False
+    delta_xyz: tuple[float, float, float] = (0.0, 0.0, 0.0)
+
+
+class PerturbationVideoOverlayWrapper(gym.Wrapper):
+    """Draw simple perturbation overlays onto rendered RGB frames."""
+
+    def __init__(self, env: gym.Env, overlay_state: PerturbationOverlayState):
+        super().__init__(env)
+        self._overlay_state = overlay_state
+
+    def render(self):
+        frame = self.env.render()
+        if frame is None or not self._overlay_state.active:
+            return frame
+        if not isinstance(frame, np.ndarray) or frame.ndim != 3 or frame.shape[2] != 3:
+            return frame
+
+        annotated = frame.copy()
+        height, width = annotated.shape[:2]
+        border_px = max(8, min(height, width) // 45)
+        color = (235, 64, 52)
+
+        cv2.rectangle(annotated, (0, 0), (width - 1, height - 1), color, border_px)
+
+        badge_w = min(width - 24, max(280, width // 4))
+        badge_h = max(72, height // 14)
+        badge_x, badge_y = 18, 18
+        overlay = annotated.copy()
+        cv2.rectangle(overlay, (badge_x, badge_y), (badge_x + badge_w, badge_y + badge_h), color, thickness=-1)
+        cv2.addWeighted(overlay, 0.78, annotated, 0.22, 0.0, annotated)
+
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        title_scale = max(0.8, width / 1700.0)
+        detail_scale = max(0.55, width / 2200.0)
+        cv2.putText(
+            annotated,
+            "PERTURBATION ACTIVE",
+            (badge_x + 16, badge_y + 30),
+            font,
+            title_scale,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        dx, dy, dz = self._overlay_state.delta_xyz
+        cv2.putText(
+            annotated,
+            f"dxyz=({dx:+.3f}, {dy:+.3f}, {dz:+.3f})",
+            (badge_x + 16, badge_y + badge_h - 18),
+            font,
+            detail_scale,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+        return annotated
+
+
+def _is_perturbation_active(frame_idx: int, intervals: tuple[int, int] | None) -> bool:
+    """Return whether perturbation should be active on the given frame."""
+    if intervals is None:
+        return True
+
+    off_frames, on_frames = intervals
+    cycle_frames = off_frames + on_frames
+    if cycle_frames <= 0:
+        return False
+    return (frame_idx % cycle_frames) >= off_frames
+
+
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     """Play with RSL-RL agent."""
@@ -419,6 +518,24 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             raise ValueError("WIDTH and HEIGHT for --video_size must be > 0.")
 
         env_cfg.viewer.resolution = (args_cli.video_size[0], args_cli.video_size[1])
+    if args_cli.perturb_video and not args_cli.video:
+        raise ValueError("--perturb-video requires --video.")
+    if args_cli.perturb_intervals is not None:
+        off_frames, on_frames = args_cli.perturb_intervals
+        if off_frames < 0:
+            raise ValueError("OFF_FRAMES for --perturb-intervals must be >= 0.")
+        if on_frames <= 0:
+            raise ValueError("ON_FRAMES for --perturb-intervals must be > 0.")
+
+    perturb_xyz = None
+    perturb_intervals = tuple(args_cli.perturb_intervals) if args_cli.perturb_intervals is not None else None
+    perturb_overlay_state = PerturbationOverlayState()
+    if args_cli.perturb_xyz is not None:
+        perturb_xyz = torch.tensor(args_cli.perturb_xyz, dtype=torch.float32, device=env_cfg.sim.device)
+        perturb_overlay_state.delta_xyz = tuple(float(value) for value in args_cli.perturb_xyz)
+        perturb_overlay_state.active = bool(
+            torch.linalg.vector_norm(perturb_xyz).item() > 0.0 and _is_perturbation_active(0, perturb_intervals)
+        )
 
     _resolve_dome_light_texture_file(env_cfg)
     _log_render_settings(env_cfg)
@@ -451,6 +568,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # convert to single-agent instance if required by the RL algorithm
     if isinstance(env.unwrapped, DirectMARLEnv):
         env = multi_agent_to_single_agent(env)
+
+    if args_cli.perturb_video:
+        env = PerturbationVideoOverlayWrapper(env, perturb_overlay_state)
 
     # wrap for video recording
     if args_cli.video:
@@ -533,6 +653,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             },
             nesting=4,
         )
+    if perturb_xyz is not None:
+        print(f"[INFO] Applying constant Cartesian perturbation: {tuple(float(v) for v in args_cli.perturb_xyz)}")
+    if perturb_intervals is not None:
+        print(
+            f"[INFO] Applying perturbation intervals: off for {perturb_intervals[0]} frame(s), "
+            f"on for {perturb_intervals[1]} frame(s)."
+        )
+    if args_cli.perturb_video:
+        print("[INFO] Perturbation video overlays enabled (badge + frame).")
     # simulate environment
     while simulation_app.is_running():
         start_time = time.time()
@@ -552,6 +681,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 _set_video_camera_pose(env, eye, lookat)
             # agent stepping
             actions = policy(obs)
+            perturb_active = perturb_xyz is not None and _is_perturbation_active(timestep, perturb_intervals)
+            perturb_overlay_state.active = perturb_active
+            if perturb_active:
+                if actions.shape[-1] < 3:
+                    raise ValueError("--perturb-xyz requires the policy action space to have at least 3 dimensions.")
+                actions[:, :3] += perturb_xyz
             # env stepping
             obs, _, dones, _ = env.step(actions)
             # reset recurrent states for episodes that have terminated
