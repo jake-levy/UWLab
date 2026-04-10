@@ -20,6 +20,12 @@ parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
 parser.add_argument("--video", action="store_true", default=False, help="Record videos during training.")
 parser.add_argument("--video_length", type=int, default=200, help="Length of the recorded video (in steps).")
 parser.add_argument(
+    "--video_warmup_steps",
+    type=int,
+    default=0,
+    help="Number of environment steps to run before video recording starts.",
+)
+parser.add_argument(
     "--video_name",
     type=str,
     default=None,
@@ -61,10 +67,10 @@ parser.add_argument(
     help="Automatically reset completed OmniReset play environments on success.",
 )
 parser.add_argument(
-    "--disable_ambient_occlusion",
-    action="store_true",
-    default=False,
-    help="Disable ambient occlusion for rendering and recorded videos.",
+    "--enable_ambient_occlusion",
+    action=argparse.BooleanOptionalAction,
+    default=None,
+    help="Enable or disable ambient occlusion for rendering and recorded videos.",
 )
 parser.add_argument(
     "--dome_light_intensity",
@@ -247,10 +253,73 @@ def _interpolate_camera_pose(frame_idx, start_frames, duration_frames, start_eye
 def _resolve_hdri_override(hdri_arg: str) -> str:
     """Resolve a CLI HDRI override into a concrete texture path."""
     hdri_presets = {
-        "soft": f"{ISAAC_NUCLEUS_DIR}/Assets/Skies/Cloudy/kloofendal_48d_partly_cloudy_4k.hdr",
+        "soft": f"{ISAAC_NUCLEUS_DIR}/Environments/Outdoor/Rivermark/dsready_content/nv_core/common_tools/content_tagging/studio_lights/Materials/photo_studio_01_4k.hdr",
         "softer": f"{ISAAC_NUCLEUS_DIR}/Assets/Skies/Cloudy/table_mountain_1_4k.hdr",
     }
     return hdri_presets.get(hdri_arg, hdri_arg)
+
+
+def _resolve_dome_light_texture_file(env_cfg):
+    """Resolve the dome/sky light HDRI to a local path before scene creation."""
+    sky_light_cfg = getattr(env_cfg.scene, "sky_light", None) or getattr(env_cfg.scene, "dome_light", None)
+    if sky_light_cfg is None or not hasattr(sky_light_cfg, "spawn") or sky_light_cfg.spawn is None:
+        return
+
+    texture_file = getattr(sky_light_cfg.spawn, "texture_file", None)
+    if not texture_file:
+        return
+
+    sky_light_cfg.spawn.texture_file = retrieve_file_path(texture_file)
+
+
+def _log_render_settings(env_cfg):
+    """Print the effective render and dome light settings after CLI overrides."""
+    sky_light_cfg = getattr(env_cfg.scene, "sky_light", None) or getattr(env_cfg.scene, "dome_light", None)
+    render_settings = {
+        "ambient_occlusion": getattr(env_cfg.sim.render, "enable_ambient_occlusion", None),
+        "reflections": getattr(env_cfg.sim.render, "enable_reflections", None),
+        "dlssg": getattr(env_cfg.sim.render, "enable_dlssg", None),
+        "dl_denoiser": getattr(env_cfg.sim.render, "enable_dl_denoiser", None),
+        "dome_light_intensity": None,
+        "dome_light_hdri": None,
+    }
+    if sky_light_cfg is not None and hasattr(sky_light_cfg, "spawn") and sky_light_cfg.spawn is not None:
+        render_settings["dome_light_intensity"] = getattr(sky_light_cfg.spawn, "intensity", None)
+        render_settings["dome_light_hdri"] = getattr(sky_light_cfg.spawn, "texture_file", None)
+
+    print("[INFO] Effective render settings:")
+    print_dict(render_settings, nesting=4)
+
+
+def _log_stage_dome_light_settings():
+    """Print the live USD dome/sky light settings after scene creation."""
+    stage = sim_utils.get_current_stage()
+    light_prim = stage.GetPrimAtPath("/World/skyLight")
+    light_path = "/World/skyLight"
+    if not light_prim.IsValid():
+        light_prim = stage.GetPrimAtPath("/World/domeLight")
+        light_path = "/World/domeLight"
+    if not light_prim.IsValid():
+        print("[INFO] Live stage dome light not found at /World/skyLight or /World/domeLight.")
+        return
+
+    stage_settings = {
+        "prim_path": light_path,
+        "inputs:intensity": None,
+        "inputs:exposure": None,
+        "inputs:texture:file": None,
+        "inputs:texture:format": None,
+        "visibleInPrimaryRay": None,
+    }
+    for attr_name in stage_settings:
+        if attr_name == "prim_path":
+            continue
+        attr = light_prim.GetAttribute(attr_name)
+        if attr.IsValid():
+            stage_settings[attr_name] = attr.Get()
+
+    print("[INFO] Live stage dome light settings:")
+    print_dict(stage_settings, nesting=4)
 
 
 def _hide_vention_metal_visuals():
@@ -287,8 +356,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # note: certain randomizations occur in the environment initialization so we set the seed here
     env_cfg.seed = agent_cfg.seed
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
-    if args_cli.disable_ambient_occlusion:
-        env_cfg.sim.render.enable_ambient_occlusion = False
+    if args_cli.enable_ambient_occlusion is not None:
+        env_cfg.sim.render.enable_ambient_occlusion = args_cli.enable_ambient_occlusion
     if args_cli.dome_light_intensity is not None:
         if args_cli.dome_light_intensity < 0.0:
             raise ValueError("--dome_light_intensity must be >= 0.")
@@ -336,6 +405,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         raise ValueError("--zoom-out-distance-delta requires --zoom-out-vid.")
     if args_cli.video_fps is not None and args_cli.video_fps <= 0:
         raise ValueError("--video_fps must be > 0.")
+    if args_cli.video_warmup_steps < 0:
+        raise ValueError("--video_warmup_steps must be >= 0.")
     if args_cli.video_name is not None:
         if not args_cli.video:
             raise ValueError("--video_name requires --video.")
@@ -348,6 +419,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             raise ValueError("WIDTH and HEIGHT for --video_size must be > 0.")
 
         env_cfg.viewer.resolution = (args_cli.video_size[0], args_cli.video_size[1])
+
+    _resolve_dome_light_texture_file(env_cfg)
+    _log_render_settings(env_cfg)
 
     # specify directory for logging experiments
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
@@ -370,6 +444,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+    _log_stage_dome_light_settings()
     if args_cli.hide_vention_metal:
         _hide_vention_metal_visuals()
 
@@ -381,7 +456,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if args_cli.video:
         video_kwargs = {
             "video_folder": os.path.join(log_dir, "videos", "play"),
-            "step_trigger": lambda step: step == 0,
+            "step_trigger": lambda step: step == args_cli.video_warmup_steps,
             "video_length": args_cli.video_length,
             "fps": args_cli.video_fps,
             "disable_logger": True,
@@ -464,8 +539,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # run everything in inference mode
         with torch.inference_mode():
             if zoom_camera_poses is not None:
+                video_timestep = max(0, timestep - args_cli.video_warmup_steps)
                 eye, lookat = _interpolate_camera_pose(
-                    timestep,
+                    video_timestep,
                     start_frames,
                     duration_frames,
                     zoom_camera_poses[0],
@@ -483,7 +559,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         if args_cli.video:
             timestep += 1
             # Exit the play loop after recording one video
-            if timestep == args_cli.video_length:
+            if timestep == args_cli.video_warmup_steps + args_cli.video_length:
                 break
 
         # time delay for real-time evaluation
