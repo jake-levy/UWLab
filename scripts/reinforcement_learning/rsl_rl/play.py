@@ -400,7 +400,6 @@ class PerturbationVideoOverlayWrapper(gym.Wrapper):
 
         font = cv2.FONT_HERSHEY_SIMPLEX
         title_scale = max(0.8, width / 1700.0)
-        detail_scale = max(0.55, width / 2200.0)
         cv2.putText(
             annotated,
             "PERTURBATION ACTIVE",
@@ -409,17 +408,6 @@ class PerturbationVideoOverlayWrapper(gym.Wrapper):
             title_scale,
             (255, 255, 255),
             2,
-            cv2.LINE_AA,
-        )
-        dx, dy, dz = self._overlay_state.delta_xyz
-        cv2.putText(
-            annotated,
-            f"dxyz=({dx:+.3f}, {dy:+.3f}, {dz:+.3f})",
-            (badge_x + 16, badge_y + badge_h - 18),
-            font,
-            detail_scale,
-            (255, 255, 255),
-            1,
             cv2.LINE_AA,
         )
         return annotated
