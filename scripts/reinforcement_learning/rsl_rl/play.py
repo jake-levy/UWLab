@@ -176,6 +176,7 @@ import os
 import time
 import torch
 import isaaclab.sim as sim_utils
+import isaaclab.utils.math as math_utils
 import cv2
 
 from rsl_rl.runners import DistillationRunner, OnPolicyRunner
@@ -190,6 +191,7 @@ from isaaclab.envs import (
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR, retrieve_file_path
 from isaaclab.utils.dict import print_dict
+from uwlab_assets.robots.ur5e_robotiq_gripper.kinematics import EE_BODY_NAME
 
 from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper
 from isaaclab_rl.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
@@ -368,6 +370,77 @@ class PerturbationOverlayState:
 
     active: bool = False
     delta_xyz: tuple[float, float, float] = (0.0, 0.0, 0.0)
+
+
+class PerturbationArrowRenderer:
+    """Render a world-space arrow near the controlled wrist using VisualizationMarkers."""
+
+    def __init__(self, env, body_name: str, env_index: int = 0):
+        from isaaclab.markers import VisualizationMarkers
+        from isaaclab.markers.config import BLUE_ARROW_X_MARKER_CFG
+
+        self._env = env
+        self._robot = env.unwrapped.scene["robot"]
+        self._env_index = env_index
+        body_ids, body_names = self._robot.find_bodies(body_name)
+        if len(body_ids) != 1:
+            raise ValueError(f"Expected one match for perturbation arrow body '{body_name}', got {body_names}.")
+        self._body_idx = body_ids[0]
+        self._tip_offset = 0.004
+        self._body_scale = 0.045
+        self._length_scale = 0.35
+        self._min_arrow_length = 5e-5
+
+        marker_cfg = BLUE_ARROW_X_MARKER_CFG.replace(prim_path="/Visuals/Perturbation/arrow")
+        marker_cfg.markers["arrow"].scale = (1.0, 1.0, 1.0)
+        if hasattr(marker_cfg.markers["arrow"], "visual_material"):
+            marker_cfg.markers["arrow"].visual_material.diffuse_color = (0.95, 0.15, 0.12)
+        self._marker = VisualizationMarkers(marker_cfg)
+        self._marker.set_visibility(False)
+
+    def clear(self):
+        self._marker.set_visibility(False)
+
+    @staticmethod
+    def _quat_from_x_axis(direction: torch.Tensor) -> torch.Tensor:
+        """Return quaternion that rotates +X to the given unit direction."""
+        x_axis = torch.tensor([1.0, 0.0, 0.0], dtype=direction.dtype, device=direction.device)
+        dot = torch.dot(x_axis, direction)
+
+        if dot < -0.999999:
+            return torch.tensor([0.0, 0.0, 0.0, 1.0], dtype=direction.dtype, device=direction.device)
+
+        xyz = torch.cross(x_axis, direction, dim=0)
+        quat = torch.cat([torch.tensor([1.0 + dot], dtype=direction.dtype, device=direction.device), xyz], dim=0)
+        return quat / torch.linalg.vector_norm(quat)
+
+    def update(self, perturb_xyz_base: torch.Tensor | None, active: bool):
+        if not active or perturb_xyz_base is None:
+            self.clear()
+            return
+
+        perturb_norm = torch.linalg.vector_norm(perturb_xyz_base).item()
+        if perturb_norm <= 1e-8:
+            self.clear()
+            return
+
+        env_idx = self._env_index
+        ee_pos_w = self._robot.data.body_pos_w[env_idx, self._body_idx]
+        root_quat_w = self._robot.data.root_quat_w[env_idx]
+        perturb_world = math_utils.quat_apply(root_quat_w.unsqueeze(0), perturb_xyz_base.unsqueeze(0)).squeeze(0)
+        direction = perturb_world / torch.linalg.vector_norm(perturb_world)
+        tip = ee_pos_w + direction * self._tip_offset
+        arrow_length = max(perturb_norm * self._length_scale, self._min_arrow_length)
+        tail = tip - direction * arrow_length
+        orientation = self._quat_from_x_axis(direction).unsqueeze(0)
+        translation = tail.unsqueeze(0)
+        scale = torch.tensor(
+            [[arrow_length, self._body_scale, self._body_scale]],
+            dtype=perturb_world.dtype,
+            device=perturb_world.device,
+        )
+        self._marker.set_visibility(True)
+        self._marker.visualize(translations=translation, orientations=orientation, scales=scale)
 
 
 class PerturbationVideoOverlayWrapper(gym.Wrapper):
@@ -553,6 +626,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if args_cli.hide_vention_metal:
         _hide_vention_metal_visuals()
 
+    perturb_arrow_renderer = None
+    if args_cli.perturb_video:
+        viewer_env_index = max(0, int(getattr(env_cfg.viewer, "env_index", 0)))
+        perturb_arrow_renderer = PerturbationArrowRenderer(env, body_name=EE_BODY_NAME, env_index=viewer_env_index)
+
     # convert to single-agent instance if required by the RL algorithm
     if isinstance(env.unwrapped, DirectMARLEnv):
         env = multi_agent_to_single_agent(env)
@@ -649,7 +727,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             f"on for {perturb_intervals[1]} frame(s)."
         )
     if args_cli.perturb_video:
-        print("[INFO] Perturbation video overlays enabled (badge + frame).")
+        print("[INFO] Perturbation video overlays enabled (badge + frame + arrow).")
     # simulate environment
     while simulation_app.is_running():
         start_time = time.time()
@@ -671,6 +749,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             actions = policy(obs)
             perturb_active = perturb_xyz is not None and _is_perturbation_active(timestep, perturb_intervals)
             perturb_overlay_state.active = perturb_active
+            if perturb_arrow_renderer is not None:
+                perturb_arrow_renderer.update(perturb_xyz, perturb_active)
             if perturb_active:
                 if actions.shape[-1] < 3:
                     raise ValueError("--perturb-xyz requires the policy action space to have at least 3 dimensions.")
@@ -691,6 +771,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             time.sleep(sleep_time)
 
     # close the simulator
+    if perturb_arrow_renderer is not None:
+        perturb_arrow_renderer.clear()
     env.close()
 
 
