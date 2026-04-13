@@ -47,6 +47,12 @@ parser.add_argument(
     help="Resolution for recorded videos as WIDTH HEIGHT. Defaults to the task viewer resolution if unset.",
 )
 parser.add_argument(
+    "--render_interval",
+    type=int,
+    default=2,
+    help="Number of physics steps between captured video frames. Lower values increase visual sampling density.",
+)
+parser.add_argument(
     "--disable_fabric", action="store_true", default=False, help="Disable fabric and use USD I/O operations."
 )
 parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
@@ -149,7 +155,7 @@ parser.add_argument(
     type=int,
     metavar=("OFF_FRAMES", "ON_FRAMES"),
     default=None,
-    help="Cycle perturbation with OFF_FRAMES disabled followed by ON_FRAMES enabled.",
+    help="Cycle perturbation in recorded video frames with OFF_FRAMES disabled followed by ON_FRAMES enabled.",
 )
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
@@ -262,6 +268,82 @@ def _set_video_camera_pose(env, eye, lookat):
     env.unwrapped.sim.set_camera_view(eye=eye.tolist(), target=lookat.tolist())
 
 
+def _write_video_frame(video_writer, frame, video_width: int, video_height: int):
+    """Convert a rendered RGB frame to MP4 format and write it."""
+    if frame is None:
+        return
+    if not isinstance(frame, np.ndarray):
+        return
+    if frame.ndim != 3 or frame.shape[2] not in (3, 4):
+        return
+
+    if frame.shape[2] == 4:
+        frame = frame[..., :3]
+    frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+    frame = cv2.resize(frame, (video_width, video_height), interpolation=cv2.INTER_CUBIC)
+    video_writer.write(frame)
+
+
+def _step_manager_env_with_render_capture(env, action, capture_callback, step_callback=None):
+    """Advance a manager-based env while capturing intermediate renders."""
+    env.action_manager.process_action(action.to(env.device))
+
+    env.recorder_manager.record_pre_step()
+
+    # Hold the same policy action across the full decimation window, but allow
+    # the caller to record frames after each physics step.
+    for physics_step in range(env.cfg.decimation):
+        env._sim_step_counter += 1
+        if step_callback is not None:
+            step_callback(physics_step, env.cfg.decimation)
+        env.action_manager.apply_action()
+        env.scene.write_data_to_sim()
+        env.sim.step(render=False)
+        env.recorder_manager.record_post_physics_decimation_step()
+        capture_callback(physics_step, env.cfg.decimation)
+        env.scene.update(dt=env.physics_dt)
+
+    # post-step:
+    # -- update env counters (used for curriculum generation)
+    env.episode_length_buf += 1  # step in current episode (per env)
+    env.common_step_counter += 1  # total step (common for all envs)
+    # -- check terminations
+    env.reset_buf = env.termination_manager.compute()
+    env.reset_terminated = env.termination_manager.terminated
+    env.reset_time_outs = env.termination_manager.time_outs
+    # # -- reward computation
+    env.reward_buf = env.reward_manager.compute(dt=env.step_dt)
+
+    if len(env.recorder_manager.active_terms) > 0:
+        # update observations for recording if needed
+        env.obs_buf = env.observation_manager.compute()
+        env.recorder_manager.record_post_step()
+
+    # -- reset envs that terminated/timed-out and log the episode information
+    reset_env_ids = env.reset_buf.nonzero(as_tuple=False).squeeze(-1)
+    if len(reset_env_ids) > 0:
+        # trigger recorder terms for pre-reset calls
+        env.recorder_manager.record_pre_reset(reset_env_ids)
+
+        env._reset_idx(reset_env_ids)
+        # update articulation kinematics
+        env.scene.write_data_to_sim()
+
+        # # trigger recorder terms for post-reset calls
+        env.recorder_manager.record_post_reset(reset_env_ids)
+
+    # -- update command
+    env.command_manager.compute(dt=env.step_dt)
+    # -- step interval events
+    if "interval" in env.event_manager.available_modes:
+        env.event_manager.apply(mode="interval", dt=env.step_dt)
+    # -- compute observations
+    # note: done after reset to get the correct observations for reset envs
+    env.obs_buf = env.observation_manager.compute(update_history=True)
+
+    return env.obs_buf, env.reward_buf, env.reset_terminated, env.reset_time_outs, env.extras
+
+
 def _interpolate_camera_pose(frame_idx, start_frames, duration_frames, start_eye, start_lookat, end_eye, end_lookat):
     """Return the camera pose to use for a given recorded frame."""
     if frame_idx < start_frames:
@@ -295,7 +377,12 @@ def _resolve_dome_light_texture_file(env_cfg):
     if not texture_file:
         return
 
-    sky_light_cfg.spawn.texture_file = retrieve_file_path(texture_file)
+    try:
+        sky_light_cfg.spawn.texture_file = retrieve_file_path(texture_file)
+    except FileNotFoundError:
+        # Fall back to the configured texture path when the local cache does not have the file.
+        # This keeps offline/headless test environments from failing during launch.
+        print(f"[WARN] Could not resolve dome light texture locally: {texture_file}")
 
 
 def _log_render_settings(env_cfg):
@@ -579,6 +666,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             raise ValueError("WIDTH and HEIGHT for --video_size must be > 0.")
 
         env_cfg.viewer.resolution = (args_cli.video_size[0], args_cli.video_size[1])
+    if args_cli.render_interval <= 0:
+        raise ValueError("--render_interval must be > 0.")
+    env_cfg.sim.render_interval = args_cli.render_interval
     if args_cli.perturb_video and not args_cli.video:
         raise ValueError("--perturb-video requires --video.")
     if args_cli.perturb_intervals is not None:
@@ -592,7 +682,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     perturb_intervals = tuple(args_cli.perturb_intervals) if args_cli.perturb_intervals is not None else None
     perturb_overlay_state = PerturbationOverlayState()
     if args_cli.perturb_xyz is not None:
-        perturb_xyz = torch.tensor(args_cli.perturb_xyz, dtype=torch.float32, device=env_cfg.sim.device)
+        perturb_xyz = torch.tensor(args_cli.perturb_xyz, dtype=torch.float32)
         perturb_overlay_state.delta_xyz = tuple(float(value) for value in args_cli.perturb_xyz)
         perturb_overlay_state.active = bool(
             torch.linalg.vector_norm(perturb_xyz).item() > 0.0 and _is_perturbation_active(0, perturb_intervals)
@@ -621,7 +711,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.log_dir = log_dir
 
     # create isaac environment
-    env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+    base_env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
     _log_stage_dome_light_settings()
     if args_cli.hide_vention_metal:
         _hide_vention_metal_visuals()
@@ -629,45 +719,57 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     perturb_arrow_renderer = None
     if args_cli.perturb_video:
         viewer_env_index = max(0, int(getattr(env_cfg.viewer, "env_index", 0)))
-        perturb_arrow_renderer = PerturbationArrowRenderer(env, body_name=EE_BODY_NAME, env_index=viewer_env_index)
+        perturb_arrow_renderer = PerturbationArrowRenderer(base_env, body_name=EE_BODY_NAME, env_index=viewer_env_index)
 
     # convert to single-agent instance if required by the RL algorithm
-    if isinstance(env.unwrapped, DirectMARLEnv):
-        env = multi_agent_to_single_agent(env)
+    if isinstance(base_env.unwrapped, DirectMARLEnv):
+        base_env = multi_agent_to_single_agent(base_env)
 
     if args_cli.perturb_video:
-        env = PerturbationVideoOverlayWrapper(env, perturb_overlay_state)
+        base_env = PerturbationVideoOverlayWrapper(base_env, perturb_overlay_state)
 
-    # wrap for video recording
+    rl_env = RslRlVecEnvWrapper(base_env, clip_actions=agent_cfg.clip_actions)
+
+    video_writer = None
     if args_cli.video:
-        video_kwargs = {
-            "video_folder": os.path.join(log_dir, "videos", "play"),
-            "step_trigger": lambda step: step == args_cli.video_warmup_steps,
-            "video_length": args_cli.video_length,
-            "fps": args_cli.video_fps,
-            "disable_logger": True,
-        }
-        if args_cli.video_name is not None:
-            video_kwargs["name_prefix"] = args_cli.video_name
+        video_folder = os.path.join(log_dir, "videos", "play")
+        os.makedirs(video_folder, exist_ok=True)
+        video_width, video_height = (
+            tuple(args_cli.video_size) if args_cli.video_size is not None else tuple(env_cfg.viewer.resolution)
+        )
+        video_fps = args_cli.video_fps if args_cli.video_fps is not None else int(round(1.0 / env_cfg.sim.dt))
+        if video_fps <= 0:
+            raise ValueError("Computed video fps must be > 0.")
+        video_name = args_cli.video_name if args_cli.video_name is not None else "play"
+        video_path = os.path.join(video_folder, f"{video_name}.mp4")
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        video_writer = cv2.VideoWriter(video_path, fourcc, video_fps, (video_width, video_height))
+        if not video_writer.isOpened():
+            raise RuntimeError(f"Could not open video writer at {video_path}.")
         print("[INFO] Recording videos during training.")
-        print_dict(video_kwargs, nesting=4)
-        env = gym.wrappers.RecordVideo(env, **video_kwargs)
-
-    # wrap around environment for rsl-rl
-    env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
+        print_dict(
+            {
+                "video_folder": video_folder,
+                "video_path": video_path,
+                "video_length": args_cli.video_length,
+                "fps": video_fps,
+                "render_interval": args_cli.render_interval,
+            },
+            nesting=4,
+        )
 
     print(f"[INFO]: Loading model checkpoint from: {resume_path}")
     # load previously trained model
     if agent_cfg.class_name == "OnPolicyRunner":
-        runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+        runner = OnPolicyRunner(rl_env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
     elif agent_cfg.class_name == "DistillationRunner":
-        runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+        runner = DistillationRunner(rl_env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
     else:
         raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
     runner.load(resume_path)
 
     # obtain the trained policy for inference
-    policy = runner.get_inference_policy(device=env.unwrapped.device)
+    policy = runner.get_inference_policy(device=base_env.unwrapped.device)
 
     # extract the neural network module
     # we do this in a try-except to maintain backwards compatibility.
@@ -691,15 +793,19 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
     export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
 
-    dt = env.unwrapped.step_dt
+    step_env = base_env.unwrapped
+    dt = step_env.step_dt
+    if perturb_xyz is not None:
+        perturb_xyz = perturb_xyz.to(step_env.device)
 
     # reset environment
-    obs = env.get_observations()
-    timestep = 0
+    obs = rl_env.get_observations()
+    policy_timestep = 0
+    video_frame_timestep = 0
     zoom_camera_poses = None
     if args_cli.zoom_out_vid is not None:
         zoom_camera_poses = _compute_zoom_out_camera_poses(
-            env,
+            step_env,
             env_cfg.viewer,
             start_eye_delta=args_cli.zoom_out_start_eye_delta,
             start_spherical=args_cli.zoom_out_start_spherical,
@@ -734,7 +840,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # run everything in inference mode
         with torch.inference_mode():
             if zoom_camera_poses is not None:
-                video_timestep = max(0, timestep - args_cli.video_warmup_steps)
+                video_timestep = max(0, policy_timestep - args_cli.video_warmup_steps)
                 eye, lookat = _interpolate_camera_pose(
                     video_timestep,
                     start_frames,
@@ -744,25 +850,67 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     zoom_camera_poses[2],
                     zoom_camera_poses[3],
                 )
-                _set_video_camera_pose(env, eye, lookat)
+                _set_video_camera_pose(base_env, eye, lookat)
             # agent stepping
             actions = policy(obs)
-            perturb_active = perturb_xyz is not None and _is_perturbation_active(timestep, perturb_intervals)
-            perturb_overlay_state.active = perturb_active
-            if perturb_arrow_renderer is not None:
-                perturb_arrow_renderer.update(perturb_xyz, perturb_active)
-            if perturb_active:
-                if actions.shape[-1] < 3:
-                    raise ValueError("--perturb-xyz requires the policy action space to have at least 3 dimensions.")
-                actions[:, :3] += perturb_xyz
-            # env stepping
-            obs, _, dones, _ = env.step(actions)
+            if video_writer is not None:
+                # Manual stepping keeps the policy action fixed while allowing us to capture
+                # multiple physics renders between policy updates.
+                current_perturb_active = perturb_xyz is not None and _is_perturbation_active(
+                    video_frame_timestep, perturb_intervals
+                )
+
+                def step_callback(physics_step_idx: int, total_physics_steps: int):
+                    nonlocal current_perturb_active
+                    step_perturb_active = perturb_xyz is not None and _is_perturbation_active(
+                        video_frame_timestep, perturb_intervals
+                    )
+                    if step_perturb_active != current_perturb_active:
+                        if actions.shape[-1] < 3:
+                            raise ValueError(
+                                "--perturb-xyz requires the policy action space to have at least 3 dimensions."
+                            )
+                        step_action = actions.clone()
+                        if step_perturb_active:
+                            step_action[:, :3] += perturb_xyz
+                        env_action = step_action.to(step_env.device)
+                        step_env.action_manager.process_action(env_action)
+                        current_perturb_active = step_perturb_active
+
+                    perturb_overlay_state.active = step_perturb_active
+                    if perturb_arrow_renderer is not None:
+                        perturb_arrow_renderer.update(perturb_xyz, step_perturb_active)
+
+                def capture_callback(physics_step_idx: int, total_physics_steps: int):
+                    nonlocal video_frame_timestep
+                    should_capture = ((physics_step_idx + 1) % args_cli.render_interval == 0) or (
+                        physics_step_idx == total_physics_steps - 1
+                    )
+                    if not should_capture:
+                        return
+                    frame = base_env.render()
+                    _write_video_frame(video_writer, frame, video_width, video_height)
+                    video_frame_timestep += 1
+
+                _, _, terminated, truncated, _ = _step_manager_env_with_render_capture(
+                    step_env, actions, capture_callback, step_callback=step_callback
+                )
+                dones = (terminated | truncated).to(dtype=torch.long)
+                obs = rl_env.get_observations()
+            else:
+                perturb_active = perturb_xyz is not None and _is_perturbation_active(policy_timestep, perturb_intervals)
+                if perturb_active:
+                    if actions.shape[-1] < 3:
+                        raise ValueError("--perturb-xyz requires the policy action space to have at least 3 dimensions.")
+                    actions[:, :3] += perturb_xyz
+                # env stepping
+                obs, _, dones, _ = rl_env.step(actions)
             # reset recurrent states for episodes that have terminated
             policy_nn.reset(dones)
         if args_cli.video:
-            timestep += 1
+            policy_timestep += 1
             # Exit the play loop after recording one video
-            if timestep == args_cli.video_warmup_steps + args_cli.video_length:
+            if policy_timestep == args_cli.video_warmup_steps + args_cli.video_length:
                 break
 
         # time delay for real-time evaluation
@@ -773,7 +921,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # close the simulator
     if perturb_arrow_renderer is not None:
         perturb_arrow_renderer.clear()
-    env.close()
+    if video_writer is not None:
+        video_writer.release()
+    rl_env.close()
 
 
 if __name__ == "__main__":
