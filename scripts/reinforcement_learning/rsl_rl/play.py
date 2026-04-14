@@ -59,6 +59,14 @@ parser.add_argument(
     help="Scale the viewer eye-to-lookat distance. Values < 1 zoom in, values > 1 zoom out.",
 )
 parser.add_argument(
+    "--camera-lookat-delta",
+    nargs=3,
+    type=float,
+    metavar=("DX", "DY", "DZ"),
+    default=None,
+    help="Translate the video camera lookat point by DX DY DZ while preserving the camera view direction.",
+)
+parser.add_argument(
     "--disable_fabric", action="store_true", default=False, help="Disable fabric and use USD I/O operations."
 )
 parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
@@ -84,6 +92,20 @@ parser.add_argument(
     action=argparse.BooleanOptionalAction,
     default=None,
     help="Enable or disable ambient occlusion for rendering and recorded videos.",
+)
+parser.add_argument(
+    "--enable_dlssg",
+    dest="enable_dlssg",
+    action="store_true",
+    default=None,
+    help="Enable DLSS Frame Generation for rendering and recorded videos.",
+)
+parser.add_argument(
+    "--disable-dlssg",
+    "--disable_dlssg",
+    dest="enable_dlssg",
+    action="store_false",
+    help="Disable DLSS Frame Generation for rendering and recorded videos.",
 )
 parser.add_argument(
     "--dome_light_intensity",
@@ -238,6 +260,7 @@ def _scale_camera_distance(eye, lookat, zoom_factor: float):
 def _compute_zoom_out_camera_poses(
     env,
     viewer_cfg,
+    camera_lookat_delta=None,
     start_eye_delta=None,
     start_spherical=None,
     start_origin_delta=None,
@@ -248,7 +271,12 @@ def _compute_zoom_out_camera_poses(
     if viewer_cfg.origin_type != "world":
         raise ValueError("--zoom-out-vid currently only supports tasks with viewer.origin_type='world'.")
 
+    start_eye_base = np.asarray(viewer_cfg.eye, dtype=float)
     start_lookat = np.asarray(viewer_cfg.lookat, dtype=float)
+    if camera_lookat_delta is not None:
+        camera_lookat_delta = np.asarray(camera_lookat_delta, dtype=float)
+        start_eye_base = start_eye_base + camera_lookat_delta
+        start_lookat = start_lookat + camera_lookat_delta
     if start_origin_delta is not None:
         start_lookat = start_lookat + np.asarray(start_origin_delta, dtype=float)
     if start_spherical is not None:
@@ -266,7 +294,7 @@ def _compute_zoom_out_camera_poses(
             dtype=float,
         )
     else:
-        start_eye = np.asarray(viewer_cfg.eye, dtype=float)
+        start_eye = start_eye_base
     if start_eye_delta is not None:
         start_eye = start_eye + np.asarray(start_eye_delta, dtype=float)
     start_eye = _scale_camera_distance(start_eye, start_lookat, camera_zoom)
@@ -661,6 +689,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
     if args_cli.enable_ambient_occlusion is not None:
         env_cfg.sim.render.enable_ambient_occlusion = args_cli.enable_ambient_occlusion
+    if args_cli.enable_dlssg is not None:
+        env_cfg.sim.render.enable_dlssg = args_cli.enable_dlssg
     if args_cli.dome_light_intensity is not None:
         if args_cli.dome_light_intensity < 0.0:
             raise ValueError("--dome_light_intensity must be >= 0.")
@@ -726,6 +756,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         raise ValueError("--render_interval must be > 0.")
     if args_cli.camera_zoom <= 0.0:
         raise ValueError("--camera-zoom must be > 0.")
+    camera_lookat_delta = (
+        np.asarray(args_cli.camera_lookat_delta, dtype=float) if args_cli.camera_lookat_delta is not None else None
+    )
     env_cfg.sim.render_interval = args_cli.render_interval
     if args_cli.perturb_video and not args_cli.video:
         raise ValueError("--perturb-video requires --video.")
@@ -863,14 +896,20 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     zoom_camera_poses = None
     default_video_camera_pose = None
     if args_cli.video:
+        default_eye = np.asarray(env_cfg.viewer.eye, dtype=float)
+        default_lookat = np.asarray(env_cfg.viewer.lookat, dtype=float)
+        if camera_lookat_delta is not None:
+            default_eye = default_eye + camera_lookat_delta
+            default_lookat = default_lookat + camera_lookat_delta
         default_video_camera_pose = (
-            _scale_camera_distance(env_cfg.viewer.eye, env_cfg.viewer.lookat, args_cli.camera_zoom),
-            np.asarray(env_cfg.viewer.lookat, dtype=float),
+            _scale_camera_distance(default_eye, default_lookat, args_cli.camera_zoom),
+            default_lookat,
         )
     if args_cli.zoom_out_vid is not None:
         zoom_camera_poses = _compute_zoom_out_camera_poses(
             step_env,
             env_cfg.viewer,
+            camera_lookat_delta=camera_lookat_delta,
             start_eye_delta=args_cli.zoom_out_start_eye_delta,
             start_spherical=args_cli.zoom_out_start_spherical,
             start_origin_delta=args_cli.zoom_out_start_origin_delta,
