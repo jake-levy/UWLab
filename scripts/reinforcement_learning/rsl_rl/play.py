@@ -67,6 +67,12 @@ parser.add_argument(
     help="Translate the video camera lookat point by DX DY DZ while preserving the camera view direction.",
 )
 parser.add_argument(
+    "--ground-z-delta",
+    type=float,
+    default=0.0,
+    help="Translate the scene ground plane along Z before creating the environment.",
+)
+parser.add_argument(
     "--disable_fabric", action="store_true", default=False, help="Disable fabric and use USD I/O operations."
 )
 parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
@@ -759,6 +765,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     camera_lookat_delta = (
         np.asarray(args_cli.camera_lookat_delta, dtype=float) if args_cli.camera_lookat_delta is not None else None
     )
+    if args_cli.ground_z_delta != 0.0:
+        ground_cfg = getattr(env_cfg.scene, "ground", None)
+        if ground_cfg is None or not hasattr(ground_cfg, "init_state") or ground_cfg.init_state is None:
+            raise ValueError("This task does not expose a configurable ground plane.")
+        ground_pos = list(getattr(ground_cfg.init_state, "pos", (0.0, 0.0, 0.0)))
+        if len(ground_pos) != 3:
+            raise ValueError("Ground plane init_state.pos must be a 3D position.")
+        ground_pos[2] += args_cli.ground_z_delta
+        ground_cfg.init_state.pos = tuple(ground_pos)
     env_cfg.sim.render_interval = args_cli.render_interval
     if args_cli.perturb_video and not args_cli.video:
         raise ValueError("--perturb-video requires --video.")
