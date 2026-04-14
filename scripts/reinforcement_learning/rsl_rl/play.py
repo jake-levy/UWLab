@@ -505,7 +505,7 @@ class PerturbationArrowRenderer:
         self._body_idx = body_ids[0]
         self._tip_offset = 0.004
         self._body_scale = 0.045
-        self._length_scale = 0.35 / 20.0
+        self._length_scale = 0.35 / 25.0
         self._min_arrow_length = 5e-5
 
         marker_cfg = BLUE_ARROW_X_MARKER_CFG.replace(prim_path="/Visuals/Perturbation/arrow")
@@ -581,23 +581,33 @@ class PerturbationVideoOverlayWrapper(gym.Wrapper):
 
         cv2.rectangle(annotated, (0, 0), (width - 1, height - 1), color, border_px)
 
-        badge_w = min(width - 24, max(280, width // 4))
-        badge_h = max(72, height // 14)
+        badge_w = min(width - 24, max(360, width // 3))
+        badge_h = max(96, height // 11)
         badge_x, badge_y = 18, 18
         overlay = annotated.copy()
         cv2.rectangle(overlay, (badge_x, badge_y), (badge_x + badge_w, badge_y + badge_h), color, thickness=-1)
         cv2.addWeighted(overlay, 0.78, annotated, 0.22, 0.0, annotated)
 
         font = cv2.FONT_HERSHEY_SIMPLEX
-        title_scale = max(0.8, width / 1700.0)
+        title = "PERTURBATION ACTIVE"
+        title_thickness = 4
+        title_target_width = badge_w * 0.96
+        title_scale = 1.0
+        title_size, title_baseline = cv2.getTextSize(title, font, title_scale, title_thickness)
+        if title_size[0] > 0:
+            title_scale *= title_target_width / title_size[0]
+        title_size, title_baseline = cv2.getTextSize(title, font, title_scale, title_thickness)
+        title_x = badge_x + (badge_w - title_size[0]) // 2
+        title_box_h = title_size[1] + title_baseline
+        title_y = badge_y + (badge_h - title_box_h) // 2 + title_size[1]
         cv2.putText(
             annotated,
-            "PERTURBATION ACTIVE",
-            (badge_x + 16, badge_y + 30),
+            title,
+            (title_x, title_y),
             font,
             title_scale,
             (255, 255, 255),
-            2,
+            title_thickness,
             cv2.LINE_AA,
         )
         return annotated
