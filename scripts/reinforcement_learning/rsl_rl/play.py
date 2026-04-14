@@ -53,6 +53,12 @@ parser.add_argument(
     help="Number of physics steps between captured video frames. Lower values increase visual sampling density.",
 )
 parser.add_argument(
+    "--camera-zoom",
+    type=float,
+    default=1.0,
+    help="Scale the viewer eye-to-lookat distance. Values < 1 zoom in, values > 1 zoom out.",
+)
+parser.add_argument(
     "--disable_fabric", action="store_true", default=False, help="Disable fabric and use USD I/O operations."
 )
 parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
@@ -218,8 +224,25 @@ from uwlab_tasks.utils.hydra import hydra_task_config
 # PLACEHOLDER: Extension template (do not remove this comment)
 
 
+def _scale_camera_distance(eye, lookat, zoom_factor: float):
+    """Scale the eye-to-lookat distance while preserving the view direction."""
+    eye = np.asarray(eye, dtype=float)
+    lookat = np.asarray(lookat, dtype=float)
+    view_vec = eye - lookat
+    view_distance = float(np.linalg.norm(view_vec))
+    if view_distance <= 1e-6:
+        raise ValueError("Viewer eye and lookat cannot be identical when scaling the camera distance.")
+    return lookat + view_vec * zoom_factor
+
+
 def _compute_zoom_out_camera_poses(
-    env, viewer_cfg, start_eye_delta=None, start_spherical=None, start_origin_delta=None, distance_delta=0.0
+    env,
+    viewer_cfg,
+    start_eye_delta=None,
+    start_spherical=None,
+    start_origin_delta=None,
+    distance_delta=0.0,
+    camera_zoom=1.0,
 ):
     """Compute the start and end camera poses for zoom-out video capture."""
     if viewer_cfg.origin_type != "world":
@@ -246,6 +269,7 @@ def _compute_zoom_out_camera_poses(
         start_eye = np.asarray(viewer_cfg.eye, dtype=float)
     if start_eye_delta is not None:
         start_eye = start_eye + np.asarray(start_eye_delta, dtype=float)
+    start_eye = _scale_camera_distance(start_eye, start_lookat, camera_zoom)
 
     env_origins = env.unwrapped.scene.env_origins.detach().cpu().numpy()
     env_xy_min = env_origins[:, :2].min(axis=0)
@@ -690,6 +714,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         env_cfg.viewer.resolution = (args_cli.video_size[0], args_cli.video_size[1])
     if args_cli.render_interval <= 0:
         raise ValueError("--render_interval must be > 0.")
+    if args_cli.camera_zoom <= 0.0:
+        raise ValueError("--camera-zoom must be > 0.")
     env_cfg.sim.render_interval = args_cli.render_interval
     if args_cli.perturb_video and not args_cli.video:
         raise ValueError("--perturb-video requires --video.")
@@ -825,6 +851,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     policy_timestep = 0
     video_frame_timestep = 0
     zoom_camera_poses = None
+    default_video_camera_pose = None
+    if args_cli.video:
+        default_video_camera_pose = (
+            _scale_camera_distance(env_cfg.viewer.eye, env_cfg.viewer.lookat, args_cli.camera_zoom),
+            np.asarray(env_cfg.viewer.lookat, dtype=float),
+        )
     if args_cli.zoom_out_vid is not None:
         zoom_camera_poses = _compute_zoom_out_camera_poses(
             step_env,
@@ -833,6 +865,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             start_spherical=args_cli.zoom_out_start_spherical,
             start_origin_delta=args_cli.zoom_out_start_origin_delta,
             distance_delta=args_cli.zoom_out_distance_delta,
+            camera_zoom=args_cli.camera_zoom,
         )
         start_frames, duration_frames = args_cli.zoom_out_vid
         print(
@@ -847,6 +880,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             },
             nesting=4,
         )
+    elif default_video_camera_pose is not None:
+        print(f"[INFO] Applying video camera zoom factor: {args_cli.camera_zoom}")
+        print_dict(
+            {
+                "eye": default_video_camera_pose[0].tolist(),
+                "lookat": default_video_camera_pose[1].tolist(),
+            },
+            nesting=4,
+        )
+        _set_video_camera_pose(base_env, default_video_camera_pose[0], default_video_camera_pose[1])
     if perturb_xyz is not None:
         print(f"[INFO] Applying constant Cartesian perturbation: {tuple(float(v) for v in args_cli.perturb_xyz)}")
     if args_cli.alternate_perturb:

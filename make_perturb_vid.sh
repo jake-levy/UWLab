@@ -14,6 +14,7 @@ python scripts/reinforcement_learning/rsl_rl/play.py \
     --headless \
     --video \
     --video_length "${VIDEO_LENGTH}" \
+    --camera-zoom 0.75 \
     --video_fps 30 \
     --video_size 1920 1080 \
     --video_name perturb_final \
