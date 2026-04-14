@@ -157,6 +157,12 @@ parser.add_argument(
     default=None,
     help="Cycle perturbation in recorded video frames with OFF_FRAMES disabled followed by ON_FRAMES enabled.",
 )
+parser.add_argument(
+    "--alternate-perturb",
+    action="store_true",
+    default=False,
+    help="Alternate the perturbation sign on successive intervals or steps.",
+)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -475,7 +481,7 @@ class PerturbationArrowRenderer:
         self._body_idx = body_ids[0]
         self._tip_offset = 0.004
         self._body_scale = 0.045
-        self._length_scale = 0.35
+        self._length_scale = 0.35 / 20.0
         self._min_arrow_length = 5e-5
 
         marker_cfg = BLUE_ARROW_X_MARKER_CFG.replace(prim_path="/Visuals/Perturbation/arrow")
@@ -583,6 +589,22 @@ def _is_perturbation_active(frame_idx: int, intervals: tuple[int, int] | None) -
     if cycle_frames <= 0:
         return False
     return (frame_idx % cycle_frames) >= off_frames
+
+
+def _perturbation_sign(frame_idx: int, intervals: tuple[int, int] | None, alternate: bool) -> float:
+    """Return the perturbation sign multiplier for the given frame."""
+    if not alternate:
+        return 1.0
+    if intervals is None:
+        return -1.0 if frame_idx % 2 else 1.0
+
+    off_frames, on_frames = intervals
+    cycle_frames = off_frames + on_frames
+    if cycle_frames <= 0:
+        return 1.0
+    if off_frames == 0:
+        return -1.0 if ((frame_idx // on_frames) % 2 == 1) else 1.0
+    return -1.0 if ((frame_idx // cycle_frames) % 2 == 1) else 1.0
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)
@@ -827,6 +849,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         )
     if perturb_xyz is not None:
         print(f"[INFO] Applying constant Cartesian perturbation: {tuple(float(v) for v in args_cli.perturb_xyz)}")
+    if args_cli.alternate_perturb:
+        print("[INFO] Alternating perturbation sign enabled (p, -p, p, -p, ...).")
     if perturb_intervals is not None:
         print(
             f"[INFO] Applying perturbation intervals: off for {perturb_intervals[0]} frame(s), "
@@ -859,27 +883,44 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 current_perturb_active = perturb_xyz is not None and _is_perturbation_active(
                     video_frame_timestep, perturb_intervals
                 )
+                current_perturb_sign = (
+                    _perturbation_sign(video_frame_timestep, perturb_intervals, args_cli.alternate_perturb)
+                    if current_perturb_active
+                    else 1.0
+                )
+                step_action = actions.clone()
+                if current_perturb_active:
+                    if actions.shape[-1] < 3:
+                        raise ValueError("--perturb-xyz requires the policy action space to have at least 3 dimensions.")
+                    step_action[:, :3] += perturb_xyz * current_perturb_sign
 
                 def step_callback(physics_step_idx: int, total_physics_steps: int):
-                    nonlocal current_perturb_active
+                    nonlocal current_perturb_active, current_perturb_sign
                     step_perturb_active = perturb_xyz is not None and _is_perturbation_active(
                         video_frame_timestep, perturb_intervals
                     )
-                    if step_perturb_active != current_perturb_active:
+                    step_perturb_sign = (
+                        _perturbation_sign(video_frame_timestep, perturb_intervals, args_cli.alternate_perturb)
+                        if step_perturb_active
+                        else 1.0
+                    )
+                    if step_perturb_active != current_perturb_active or step_perturb_sign != current_perturb_sign:
                         if actions.shape[-1] < 3:
                             raise ValueError(
                                 "--perturb-xyz requires the policy action space to have at least 3 dimensions."
                             )
                         step_action = actions.clone()
                         if step_perturb_active:
-                            step_action[:, :3] += perturb_xyz
+                            step_action[:, :3] += perturb_xyz * step_perturb_sign
                         env_action = step_action.to(step_env.device)
                         step_env.action_manager.process_action(env_action)
                         current_perturb_active = step_perturb_active
+                        current_perturb_sign = step_perturb_sign
 
                     perturb_overlay_state.active = step_perturb_active
                     if perturb_arrow_renderer is not None:
-                        perturb_arrow_renderer.update(perturb_xyz, step_perturb_active)
+                        step_perturb_xyz = perturb_xyz * step_perturb_sign if step_perturb_active else None
+                        perturb_arrow_renderer.update(step_perturb_xyz, step_perturb_active)
 
                 def capture_callback(physics_step_idx: int, total_physics_steps: int):
                     nonlocal video_frame_timestep
@@ -893,7 +934,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     video_frame_timestep += 1
 
                 _, _, terminated, truncated, _ = _step_manager_env_with_render_capture(
-                    step_env, actions, capture_callback, step_callback=step_callback
+                    step_env, step_action, capture_callback, step_callback=step_callback
                 )
                 dones = (terminated | truncated).to(dtype=torch.long)
                 obs = rl_env.get_observations()
@@ -902,7 +943,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 if perturb_active:
                     if actions.shape[-1] < 3:
                         raise ValueError("--perturb-xyz requires the policy action space to have at least 3 dimensions.")
-                    actions[:, :3] += perturb_xyz
+                    perturb_sign = _perturbation_sign(policy_timestep, perturb_intervals, args_cli.alternate_perturb)
+                    actions[:, :3] += perturb_xyz * perturb_sign
                 # env stepping
                 obs, _, dones, _ = rl_env.step(actions)
             # reset recurrent states for episodes that have terminated
