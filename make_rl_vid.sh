@@ -8,7 +8,7 @@ python scripts/reinforcement_learning/rsl_rl/play.py \
     env.scene.receptive_object=peghole \
     --headless \
     --video \
-    --video_length 200 \
+    --video_length 600 \
     --camera-zoom 1.5 \
     --video_fps 30 \
     --video_size 1920 1080 \
@@ -18,7 +18,7 @@ python scripts/reinforcement_learning/rsl_rl/play.py \
     --dome_light_hdri soft \
     --disable-dlssg \
     --hide_vention_metal \
-    --camera-lookat-delta 2.0 0.0 0.0 \
+    --camera-lookat-delta 2.5 0.0 0.0 \
     --ground-z-delta 0.2
 
 

@@ -970,18 +970,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         start_time = time.time()
         # run everything in inference mode
         with torch.inference_mode():
-            if zoom_camera_poses is not None:
-                video_timestep = max(0, policy_timestep - args_cli.video_warmup_steps)
-                eye, lookat = _interpolate_camera_pose(
-                    video_timestep,
-                    start_frames,
-                    duration_frames,
-                    zoom_camera_poses[0],
-                    zoom_camera_poses[1],
-                    zoom_camera_poses[2],
-                    zoom_camera_poses[3],
-                )
-                _set_video_camera_pose(base_env, eye, lookat)
             # agent stepping
             actions = policy(obs)
             if video_writer is not None:
@@ -1036,6 +1024,21 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     )
                     if not should_capture:
                         return
+                    if policy_timestep < args_cli.video_warmup_steps:
+                        return
+                    if video_frame_timestep >= args_cli.video_length:
+                        return
+                    if zoom_camera_poses is not None:
+                        eye, lookat = _interpolate_camera_pose(
+                            video_frame_timestep,
+                            start_frames,
+                            duration_frames,
+                            zoom_camera_poses[0],
+                            zoom_camera_poses[1],
+                            zoom_camera_poses[2],
+                            zoom_camera_poses[3],
+                        )
+                        _set_video_camera_pose(base_env, eye, lookat)
                     frame = base_env.render()
                     _write_video_frame(video_writer, frame, video_width, video_height)
                     video_frame_timestep += 1
@@ -1059,7 +1062,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         if args_cli.video:
             policy_timestep += 1
             # Exit the play loop after recording one video
-            if policy_timestep == args_cli.video_warmup_steps + args_cli.video_length:
+            if video_frame_timestep >= args_cli.video_length:
                 break
 
         # time delay for real-time evaluation
